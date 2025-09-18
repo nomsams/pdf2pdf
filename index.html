@@ -16,7 +16,7 @@
     body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji"}
     .wrap{max-width:980px;margin:40px auto;padding:0 16px}
     .card{background:linear-gradient(180deg,#121623 0%,#0f1320 100%);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
-    h1{font-size:26px;margin:0 0 4px;letter-spacing:.2px;background:linear-gradient(90deg,#dfe7ff,#82b1ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+    h1{font-size:26px;margin:0 0 4px;letter-spacing:.2px;background:linear-gradient(90deg,#dfe7ff,#82b1ff); -webkit-background-clip:text;background-clip:text;color:transparent}
     .sub{color:var(--muted);margin-bottom:18px}
     .row{display:grid;gap:12px;grid-template-columns:1fr 1fr}
     @media (max-width:800px){.row{grid-template-columns:1fr}}
@@ -34,7 +34,7 @@
     button.ghost{background:transparent;border-color:var(--border);color:var(--muted)}
     .progress{height:10px;background:#0c0f17;border:1px solid var(--border);border-radius:999px;overflow:hidden}
     .bar{height:100%;width:0%;background:linear-gradient(90deg,#6aa7ff,#45d48a);transition:width .2s}
-    .log{height:300px;overflow:auto;background:#0c0f17;border:1px solid var(--border);border-radius:10px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}
+    .log{height:320px;overflow:auto;background:#0c0f17;border:1px solid var(--border);border-radius:10px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}
     .kv{display:grid;grid-template-columns:160px 1fr;gap:6px;margin:10px 0 0}
     .kv div:nth-child(odd){color:var(--muted)}
     a.download{color:#a7c4ff;text-decoration:none;border-bottom:1px dashed #2b63ff}
@@ -57,19 +57,23 @@
           <div class="controls" style="margin-top:12px">
             <label for="mode">Mode</label>
             <select id="mode">
+              <option value="rasterize" selected>Rasterize (maximum size reduction)</option>
+              <option value="mixed">Mixed (searchable: raster pages + hidden text)</option>
               <option value="optimize">Optimize (preserve text & vectors)</option>
-              <option value="rasterize">Rasterize (maximum size reduction)</option>
             </select>
-            <div id="rasterOpts" style="display:none;margin-top:8px">
+            <div id="rasterOpts" style="display:block;margin-top:8px">
               <div class="inline">
                 <div>
                   <label for="dpi">DPI (render resolution)</label>
-                  <input id="dpi" type="number" min="36" max="300" value="144" />
+                  <input id="dpi" type="number" min="72" max="600" value="300" />
                 </div>
                 <div>
                   <label for="quality">JPEG quality</label>
                   <input id="quality" type="number" min="0.3" max="0.95" step="0.05" value="0.75" />
                 </div>
+              </div>
+              <div style="margin-top:6px">
+                <label><input id="debugText" type="checkbox" /> Show text overlay (debug)</label>
               </div>
             </div>
             <div style="margin-top:10px">
@@ -116,20 +120,23 @@ function setProgress(p){ $("bar").style.width = `${Math.max(0,Math.min(100,p))}%
 function fmtBytes(n){ if(n===0) return "0 B"; const k=1024,u=["B","KB","MB","GB"];const i=Math.floor(Math.log(n)/Math.log(k)); return `${(n/Math.pow(k,i)).toFixed(i?1:0)} ${u[i]}`; }
 function clamp(v,min,max){ return Math.max(min, Math.min(max,v)); }
 
+// Polyfill canvas.toBlob in Safari
+if (!HTMLCanvasElement.prototype.toBlob) {
+  HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+    const dataURL = this.toDataURL(type, quality).split(',')[1];
+    setTimeout(()=>callback(new Blob([Uint8Array.from(atob(dataURL), c=>c.charCodeAt(0))], {type: type||'image/png'})));
+  };
+}
+
 // Prevent default browser drop behavior
 window.addEventListener('dragover', e=>e.preventDefault());
 window.addEventListener('drop', e=>e.preventDefault());
 
 // pdf.js worker config (after library script tag)
 (function ensurePdfJs(){
-  const ok = typeof window.pdfjsLib !== 'undefined';
-  if (!ok){
-    log('pdf.js not yet available; waiting…','warn');
-  }
   const trySet = () => {
-    if (typeof pdfjsLib !== 'undefined'){
+    if (typeof window.pdfjsLib !== 'undefined'){
       if (!pdfjsLib.GlobalWorkerOptions.workerSrc){
-        // Use the same CDN/version for worker
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
       }
       log(`pdf.js ready (v${pdfjsLib.version || '2.x'}).`,'ok');
@@ -160,7 +167,7 @@ async function loadFile(f){
 }
 
 // ========= UI toggles =========
-$("mode").addEventListener('change',()=>{ $("rasterOpts").style.display = $("mode").value==='rasterize' ? 'block':'none'; });
+$("mode").addEventListener('change',()=>{ $("rasterOpts").style.display = $("mode").value!=='optimize' ? 'block':'none'; });
 $("cancel").addEventListener('click',()=>{ if(running){ abortFlag=true; log('Cancellation requested…','warn'); }});
 $("reset").addEventListener('click', resetUI);
 function resetUI(){ abortFlag=false; running=false; fileBytes=null; fileName=null; $("fname").textContent='—'; $("fsize").textContent='—'; $("osize").textContent='—'; $("reduct").textContent='—'; setProgress(0); $("downloadSlot").innerHTML=''; logEl.textContent=''; fileInput.value=''; log('Reset ready.'); }
@@ -183,7 +190,6 @@ async function compressOptimize(bytes, opts){
         const del = key => { if(cat && cat.dict && cat.dict.has(PDFName.of(key))) { cat.dict.delete(PDFName.of(key)); } };
         del('Metadata'); del('PageLabels'); del('Names'); del('Outlines'); del('Threads'); del('OCProperties'); del('PieceInfo'); del('StructTreeRoot');
       }
-      // Strip page-level extras
       for (const p of doc.getPages()){
         const pd = p.node.dict;
         ['Annots','AA','Metadata','Thumb'].forEach(k=>{ if(pd.has(PDFName.of(k))) pd.delete(PDFName.of(k)); });
@@ -198,13 +204,12 @@ async function compressOptimize(bytes, opts){
 }
 
 // ========= Rasterize (max reduction) =========
-async function compressRasterize(bytes, { dpi=144, quality=0.75 }){
+async function compressRasterize(bytes, { dpi=300, quality=0.75 }){
   if (typeof pdfjsLib === 'undefined') throw new Error('pdf.js not loaded');
-  const scaleDPI = clamp(dpi, 36, 300);
+  const scaleDPI = clamp(dpi, 72, 600);
   const q = clamp(quality, .3, .95);
   log(`Rasterizing at ${scaleDPI} DPI, JPEG quality ${q}…`);
 
-  // Ensure worker src is set
   pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsLib.GlobalWorkerOptions.workerSrc || 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
 
   const pdf = await pdfjsLib.getDocument({ data: bytes, useSystemFonts: true }).promise;
@@ -235,9 +240,95 @@ async function compressRasterize(bytes, { dpi=144, quality=0.75 }){
     outPage.drawImage(img, { x:0, y:0, width: img.width, height: img.height });
     log(`Page ${i} embedded (${fmtBytes(imgBytes.length)}).`, 'ok');
 
-    // free
     canvas.width = 0; canvas.height = 0;
     setProgress(Math.round(70 + (i/pageCount)*20));
+  }
+
+  const out = await outDoc.save({ useObjectStreams:true, addDefaultPage:false });
+  return out;
+}
+
+// ========= Mixed (searchable: raster + hidden text) =========
+async function compressMixed(bytes, { dpi=300, quality=0.75, debugText=false }){
+  if (typeof pdfjsLib === 'undefined') throw new Error('pdf.js not loaded');
+  const scaleDPI = clamp(dpi, 72, 600);
+  const q = clamp(quality, .3, .95);
+  log(`Mixed mode: raster ${scaleDPI} DPI JPEG ${q} + hidden text overlay…`);
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsLib.GlobalWorkerOptions.workerSrc || 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+  const pdf = await pdfjsLib.getDocument({ data: bytes, useSystemFonts: true }).promise;
+  const pageCount = pdf.numPages; log(`Pages: ${pageCount}`);
+
+  const { PDFDocument, StandardFonts, rgb } = PDFLib;
+  const outDoc = await PDFDocument.create();
+  const helv = await outDoc.embedFont(StandardFonts.Helvetica);
+
+  const pxPerInch = 96; const baseScale = scaleDPI/pxPerInch;
+
+  for (let i=1; i<=pageCount; i++){
+    if (abortFlag) throw new Error('Cancelled');
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: baseScale });
+
+    // Render page bitmap first
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    setProgress(Math.round(((i-1)/pageCount)*50)+5);
+    await page.render({ canvasContext: ctx, viewport, intent: 'print' }).promise;
+
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', q));
+    const imgBytes = new Uint8Array(await blob.arrayBuffer());
+    const img = await outDoc.embedJpg(imgBytes);
+
+    const outPage = outDoc.addPage([img.width, img.height]);
+    outPage.drawImage(img, { x:0, y:0, width: img.width, height: img.height });
+
+    // Extract text content and overlay invisible text
+    const text = await page.getTextContent();
+    let placed = 0;
+    const items = text.items || [];
+
+    for (const it of items){
+      // Map PDF.js text matrix into viewport space
+      // Combined transform: viewport.transform * it.transform
+      const m = pdfjsLib.Util.transform(viewport.transform, it.transform);
+      // m = [a,b,c,d,e,f]; e,f are top-left of the text run in canvas coords
+      const x = m[4];
+      const yTop = m[5];
+      // Approximate font size using vertical scale of the matrix
+      const fontSize = Math.max(0.1, Math.hypot(m[2], m[3]));
+      // Convert canvas (origin top-left) to PDF (origin bottom-left)
+      const y = viewport.height - yTop - fontSize * 0.2; // slight baseline shift
+
+      // Some strings are extremely long; split by spaces to avoid overflows
+      const chunks = (it.str || '').split(/(\s+)/).filter(Boolean);
+      let cx = x;
+      for (const chunk of chunks){
+        if (!chunk) continue;
+        outPage.drawText(chunk, {
+          x: cx,
+          y,
+          size: fontSize,
+          font: helv,
+          color: debugText ? rgb(1, 0, 0) : rgb(0, 0, 0),
+          opacity: debugText ? 0.7 : 0.01, // keep nearly invisible but selectable
+        });
+        // Advance roughly by chunk width (estimate with Helvetica width)
+        cx += helv.widthOfTextAtSize(chunk, fontSize);
+      }
+      placed++;
+    }
+
+    log(`Page ${i}: text items placed ${placed}.`, 'ok');
+
+    // Free canvas mem
+    canvas.width = 0; canvas.height = 0;
+    setProgress(Math.round(50 + (i/pageCount)*45));
   }
 
   const out = await outDoc.save({ useObjectStreams:true, addDefaultPage:false });
@@ -251,13 +342,21 @@ $("start").addEventListener('click', async ()=>{
   abortFlag=false; running=true; setProgress(3);
 
   const mode = $("mode").value;
-  const opts = { stripMeta: $("stripMeta").checked, linearize: $("linearize").checked, safeMode: $("safeMode").checked, dpi: parseInt($("dpi").value,10)||144, quality: parseFloat($("quality").value)||0.75 };
+  const opts = {
+    stripMeta: $("stripMeta").checked,
+    linearize: $("linearize").checked,
+    safeMode: $("safeMode").checked,
+    dpi: parseInt($("dpi").value,10)||300,
+    quality: parseFloat($("quality").value)||0.75,
+    debugText: $("debugText").checked
+  };
 
   try{
     log(`Starting compression in "${mode}" mode…`);
     const t0 = performance.now();
     let out;
     if (mode==='optimize') out = await compressOptimize(fileBytes, opts);
+    else if (mode==='mixed') out = await compressMixed(fileBytes, opts);
     else out = await compressRasterize(fileBytes, opts);
 
     if (opts.linearize) log('Note: true PDF linearization is complex and not fully implemented (UI option is advisory).','warn');
