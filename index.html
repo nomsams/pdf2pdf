@@ -57,8 +57,9 @@
           <div class="controls" style="margin-top:12px">
             <label for="mode">Mode</label>
             <select id="mode">
-              <option value="rasterize" selected>Rasterize (maximum size reduction)</option>
-              <option value="mixed">Mixed (searchable: raster pages + hidden text)</option>
+              <option value="mixed" selected>Mixed (searchable: raster + hidden text)</option>
+              <option value="rasterize">Rasterize (maximum size reduction)</option>
+              <option value="aggressive">Aggressive (tiny file, grayscale)</option>
               <option value="optimize">Optimize (preserve text & vectors)</option>
             </select>
             <div id="rasterOpts" style="display:block;margin-top:8px">
@@ -295,17 +296,12 @@ async function compressMixed(bytes, { dpi=300, quality=0.75, debugText=false }){
 
     for (const it of items){
       // Map PDF.js text matrix into viewport space
-      // Combined transform: viewport.transform * it.transform
       const m = pdfjsLib.Util.transform(viewport.transform, it.transform);
-      // m = [a,b,c,d,e,f]; e,f are top-left of the text run in canvas coords
       const x = m[4];
       const yTop = m[5];
-      // Approximate font size using vertical scale of the matrix
       const fontSize = Math.max(0.1, Math.hypot(m[2], m[3]));
-      // Convert canvas (origin top-left) to PDF (origin bottom-left)
-      const y = viewport.height - yTop - fontSize * 0.2; // slight baseline shift
+      const y = viewport.height - yTop - fontSize * 0.2; // baseline approx
 
-      // Some strings are extremely long; split by spaces to avoid overflows
       const chunks = (it.str || '').split(/(\s+)/).filter(Boolean);
       let cx = x;
       for (const chunk of chunks){
@@ -316,9 +312,8 @@ async function compressMixed(bytes, { dpi=300, quality=0.75, debugText=false }){
           size: fontSize,
           font: helv,
           color: debugText ? rgb(1, 0, 0) : rgb(0, 0, 0),
-          opacity: debugText ? 0.7 : 0.01, // keep nearly invisible but selectable
+          opacity: debugText ? 0.7 : 0.01,
         });
-        // Advance roughly by chunk width (estimate with Helvetica width)
         cx += helv.widthOfTextAtSize(chunk, fontSize);
       }
       placed++;
@@ -326,9 +321,72 @@ async function compressMixed(bytes, { dpi=300, quality=0.75, debugText=false }){
 
     log(`Page ${i}: text items placed ${placed}.`, 'ok');
 
-    // Free canvas mem
     canvas.width = 0; canvas.height = 0;
     setProgress(Math.round(50 + (i/pageCount)*45));
+  }
+
+  const out = await outDoc.save({ useObjectStreams:true, addDefaultPage:false });
+  return out;
+}
+
+// ========= Aggressive (absolute minimum size) =========
+async function compressAggressive(bytes) {
+  if (typeof pdfjsLib === 'undefined') throw new Error('pdf.js not loaded');
+  log('Aggressive mode: target ~1.0 MP/page, grayscale, JPEG q=0.5 …');
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsLib.GlobalWorkerOptions.workerSrc || 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+  const pdf = await pdfjsLib.getDocument({ data: bytes, useSystemFonts: true }).promise;
+  const pageCount = pdf.numPages; log(`Pages: ${pageCount}`);
+  const { PDFDocument } = PDFLib; const outDoc = await PDFDocument.create();
+
+  const targetMP = 1.0; // megapixels per page
+
+  for (let i=1; i<=pageCount; i++){
+    if (abortFlag) throw new Error('Cancelled');
+    const page = await pdf.getPage(i);
+
+    // Get base size at scale=1
+    const base = page.getViewport({ scale: 1 });
+    const basePixels = base.width * base.height;
+    let scale = Math.sqrt((targetMP * 1_000_000) / Math.max(1, basePixels));
+    scale = Math.min(scale, 1); // never upscale
+    // Also cap to ~120 DPI vs 96 CSS px/in (roughly 1.25x)
+    const maxAggressiveScale = 120/96;
+    scale = Math.min(scale, maxAggressiveScale);
+
+    const viewport = page.getViewport({ scale });
+
+    // Render to canvas
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    setProgress(Math.round(((i-1)/pageCount)*60)+5);
+    await page.render({ canvasContext: ctx, viewport, intent: 'print' }).promise;
+
+    // Convert to grayscale to shrink size further
+    const imgData = ctx.getImageData(0,0,canvas.width,canvas.height);
+    const data = imgData.data;
+    for (let p=0; p<data.length; p+=4){
+      const r=data[p], g=data[p+1], b=data[p+2];
+      // Rec. 709 luma
+      const y = 0.2126*r + 0.7152*g + 0.0722*b;
+      data[p]=data[p+1]=data[p+2]=y;
+    }
+    ctx.putImageData(imgData,0,0);
+
+    // JPEG at lower quality
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.5));
+    const imgBytes = new Uint8Array(await blob.arrayBuffer());
+
+    const img = await outDoc.embedJpg(imgBytes);
+    const outPage = outDoc.addPage([img.width, img.height]);
+    outPage.drawImage(img, { x:0, y:0, width: img.width, height: img.height });
+    log(`Aggressive page ${i} embedded (${fmtBytes(imgBytes.length)}).`, 'ok');
+
+    canvas.width = 0; canvas.height = 0;
+    setProgress(Math.round(70 + (i/pageCount)*20));
   }
 
   const out = await outDoc.save({ useObjectStreams:true, addDefaultPage:false });
@@ -357,6 +415,7 @@ $("start").addEventListener('click', async ()=>{
     let out;
     if (mode==='optimize') out = await compressOptimize(fileBytes, opts);
     else if (mode==='mixed') out = await compressMixed(fileBytes, opts);
+    else if (mode==='aggressive') out = await compressAggressive(fileBytes);
     else out = await compressRasterize(fileBytes, opts);
 
     if (opts.linearize) log('Note: true PDF linearization is complex and not fully implemented (UI option is advisory).','warn');
